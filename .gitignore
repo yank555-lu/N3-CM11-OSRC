@@ -83,3 +83,9 @@ GTAGS
 *.orig
 *~
 \#*#
+
+#
+# User added
+#
+firmware/epen/*.bin
+
