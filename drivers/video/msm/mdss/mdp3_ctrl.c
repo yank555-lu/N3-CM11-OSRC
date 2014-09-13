@@ -1,4 +1,4 @@
-/* Copyright (c) 2013-2014, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2013, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -25,6 +25,7 @@
 #include "mdp3.h"
 #include "mdp3_ppp.h"
 
+#define MDP_CORE_CLK_RATE	100000000
 #define VSYNC_EXPIRE_TICK	4
 
 static void mdp3_ctrl_pan_display(struct msm_fb_data_type *mfd);
@@ -90,36 +91,6 @@ static int mdp3_bufq_count(struct mdp3_buffer_queue *bufq)
 	return bufq->count;
 }
 
-void mdp3_ctrl_notifier_register(struct mdp3_session_data *ses,
-	struct notifier_block *notifier)
-{
-	blocking_notifier_chain_register(&ses->notifier_head, notifier);
-}
-
-void mdp3_ctrl_notifier_unregister(struct mdp3_session_data *ses,
-	struct notifier_block *notifier)
-{
-	blocking_notifier_chain_unregister(&ses->notifier_head, notifier);
-}
-
-int mdp3_ctrl_notify(struct mdp3_session_data *ses, int event)
-{
-	return blocking_notifier_call_chain(&ses->notifier_head, event, ses);
-}
-
-static void mdp3_dispatch_dma_done(struct work_struct *work)
-{
-	struct mdp3_session_data *session;
-
-	pr_debug("%s\n", __func__);
-	session = container_of(work, struct mdp3_session_data,
-				dma_done_work);
-	if (!session)
-		return;
-
-	mdp3_ctrl_notify(session, MDP_NOTIFY_FRAME_DONE);
-}
-
 static void mdp3_dispatch_clk_off(struct work_struct *work)
 {
 	struct mdp3_session_data *session;
@@ -150,13 +121,6 @@ void vsync_notify_handler(void *arg)
 	sysfs_notify_dirent(session->vsync_event_sd);
 }
 
-void dma_done_notify_handler(void *arg)
-{
-	struct mdp3_session_data *session = (struct mdp3_session_data *)arg;
-	schedule_work(&session->dma_done_work);
-	complete(&session->dma_completion);
-}
-
 void vsync_count_down(void *arg)
 {
 	struct mdp3_session_data *session = (struct mdp3_session_data *)arg;
@@ -176,8 +140,8 @@ void mdp3_ctrl_reset_countdown(struct mdp3_session_data *session,
 static int mdp3_ctrl_vsync_enable(struct msm_fb_data_type *mfd, int enable)
 {
 	struct mdp3_session_data *mdp3_session;
-	struct mdp3_notification vsync_client;
-	struct mdp3_notification *arg = NULL;
+	struct mdp3_vsync_notification vsync_client;
+	struct mdp3_vsync_notification *arg = NULL;
 
 	pr_debug("mdp3_ctrl_vsync_enable =%d\n", enable);
 	mdp3_session = (struct mdp3_session_data *)mfd->mdp.private1;
@@ -214,8 +178,7 @@ static int mdp3_ctrl_vsync_enable(struct msm_fb_data_type *mfd, int enable)
 	 * active or when dsi clocks are currently off
 	 */
 	if (enable && mdp3_session->status == 1
-			&& (mdp3_session->vsync_before_commit ||
-			!mdp3_session->intf->active)) {
+			&& mdp3_session->vsync_before_commit) {
 		mod_timer(&mdp3_session->vsync_timer,
 			jiffies + msecs_to_jiffies(mdp3_session->vsync_period));
 	} else if (enable && !mdp3_session->clk_on) {
@@ -231,8 +194,7 @@ static int mdp3_ctrl_vsync_enable(struct msm_fb_data_type *mfd, int enable)
 void mdp3_vsync_timer_func(unsigned long arg)
 {
 	struct mdp3_session_data *session = (struct mdp3_session_data *)arg;
-	if (session->status == 1 && (session->vsync_before_commit ||
-			!session->intf->active)) {
+	if (session->status == 1 && session->vsync_before_commit) {
 		pr_debug("mdp3_vsync_timer_func trigger\n");
 		vsync_notify_handler(session);
 		mod_timer(&session->vsync_timer,
@@ -404,10 +366,10 @@ static int mdp3_ctrl_get_intf_type(struct msm_fb_data_type *mfd)
 	return type;
 }
 
-static int mdp3_ctrl_get_source_format(u32 imgType)
+static int mdp3_ctrl_get_source_format(struct msm_fb_data_type *mfd)
 {
 	int format;
-	switch (imgType) {
+	switch (mfd->fb_imgType) {
 	case MDP_RGB_565:
 		format = MDP3_DMA_IBUF_FORMAT_RGB565;
 		break;
@@ -424,10 +386,10 @@ static int mdp3_ctrl_get_source_format(u32 imgType)
 	return format;
 }
 
-static int mdp3_ctrl_get_pack_pattern(u32 imgType)
+static int mdp3_ctrl_get_pack_pattern(struct msm_fb_data_type *mfd)
 {
 	int packPattern = MDP3_DMA_OUTPUT_PACK_PATTERN_RGB;
-	if (imgType == MDP_RGBA_8888)
+	if (mfd->fb_imgType == MDP_RGBA_8888)
 		packPattern = MDP3_DMA_OUTPUT_PACK_PATTERN_BGR;
 	return packPattern;
 }
@@ -502,7 +464,6 @@ static int mdp3_ctrl_dma_init(struct msm_fb_data_type *mfd,
 	int frame_rate = mfd->panel_info->mipi.frame_rate;
 	int vbp, vfp, vspw;
 	int vtotal, vporch;
-	struct mdp3_notification dma_done_callback;
 
 	vbp = panel_info->lcdc.v_back_porch;
 	vfp = panel_info->lcdc.v_front_porch;
@@ -513,7 +474,7 @@ static int mdp3_ctrl_dma_init(struct msm_fb_data_type *mfd,
 	fix = &fbi->fix;
 	var = &fbi->var;
 
-	sourceConfig.format = mdp3_ctrl_get_source_format(mfd->fb_imgType);
+	sourceConfig.format = mdp3_ctrl_get_source_format(mfd);
 	sourceConfig.width = panel_info->xres;
 	sourceConfig.height = panel_info->yres;
 	sourceConfig.x = 0;
@@ -528,7 +489,7 @@ static int mdp3_ctrl_dma_init(struct msm_fb_data_type *mfd,
 	outputConfig.out_sel = mdp3_ctrl_get_intf_type(mfd);
 	outputConfig.bit_mask_polarity = 0;
 	outputConfig.color_components_flip = 0;
-	outputConfig.pack_pattern = mdp3_ctrl_get_pack_pattern(mfd->fb_imgType);
+	outputConfig.pack_pattern = mdp3_ctrl_get_pack_pattern(mfd);
 	outputConfig.pack_align = MDP3_DMA_OUTPUT_PACK_ALIGN_LSB;
 	outputConfig.color_comp_out_bits = (MDP3_DMA_OUTPUT_COMP_BITS_8 << 4) |
 					(MDP3_DMA_OUTPUT_COMP_BITS_8 << 2)|
@@ -538,13 +499,6 @@ static int mdp3_ctrl_dma_init(struct msm_fb_data_type *mfd,
 		rc = dma->dma_config(dma, &sourceConfig, &outputConfig);
 	else
 		rc = -EINVAL;
-
-	if (outputConfig.out_sel == MDP3_DMA_OUTPUT_SEL_DSI_CMD) {
-		dma_done_callback.handler = dma_done_notify_handler;
-		dma_done_callback.arg = mfd->mdp.private1;
-		dma->dma_done_notifier(dma, &dma_done_callback);
-	}
-
 	return rc;
 }
 
@@ -573,8 +527,6 @@ static int mdp3_ctrl_on(struct msm_fb_data_type *mfd)
 	}
 
 	mdp3_batfet_ctrl(true);
-	mdp3_ctrl_notifier_register(mdp3_session,
-		&mdp3_session->mfd->mdp_sync_pt_data.notifier);
 
 	rc = mdp3_iommu_enable(MDP3_CLIENT_DMA_P);
 	if (rc) {
@@ -625,8 +577,17 @@ static int mdp3_ctrl_on(struct msm_fb_data_type *mfd)
 	}
 
 	mdp3_session->clk_on = 1;
-
-	mdp3_session->first_commit = true;
+	pr_debug("mdp3_ctrl_on dma start\n");
+	if (mfd->fbi->screen_base) {
+		rc = mdp3_session->dma->start(mdp3_session->dma,
+						mdp3_session->intf);
+		if (rc) {
+			pr_err("fail to start the MDP display interface\n");
+			goto on_error;
+		}
+	} else {
+		mdp3_session->first_commit = true;
+	}
 
 on_error:
 	if (!rc)
@@ -651,6 +612,9 @@ static int mdp3_ctrl_off(struct msm_fb_data_type *mfd)
 
 	panel = mdp3_session->panel;
 	mutex_lock(&mdp3_session->lock);
+
+	if (panel && panel->set_backlight)
+		panel->set_backlight(panel, 0);
 
 	if (!mdp3_session->status) {
 		pr_debug("fb%d is off already", mfd->index);
@@ -697,8 +661,6 @@ static int mdp3_ctrl_off(struct msm_fb_data_type *mfd)
 	if (rc)
 		pr_err("fail to dettach MDP DMA SMMU\n");
 
-	mdp3_ctrl_notifier_unregister(mdp3_session,
-		&mdp3_session->mfd->mdp_sync_pt_data.notifier);
 	mdp3_batfet_ctrl(false);
 	mdp3_session->vsync_enabled = 0;
 	atomic_set(&mdp3_session->vsync_countdown, 0);
@@ -706,11 +668,9 @@ static int mdp3_ctrl_off(struct msm_fb_data_type *mfd)
 off_error:
 	mdp3_session->status = 0;
 	mdp3_bufq_deinit(&mdp3_session->bufq_out);
-	if (mdp3_session->overlay.id != MSMFB_NEW_REQUEST) {
-		mdp3_session->overlay.id = MSMFB_NEW_REQUEST;
-		mdp3_bufq_deinit(&mdp3_session->bufq_in);
-	}
 	mutex_unlock(&mdp3_session->lock);
+	if (mdp3_session->overlay.id != MSMFB_NEW_REQUEST)
+		mdp3_overlay_unset(mfd, mdp3_session->overlay.id);
 	return 0;
 }
 
@@ -720,7 +680,7 @@ static int mdp3_ctrl_reset_cmd(struct msm_fb_data_type *mfd)
 	struct mdp3_session_data *mdp3_session;
 	struct mdp3_dma *mdp3_dma;
 	struct mdss_panel_data *panel;
-	struct mdp3_notification vsync_client;
+	struct mdp3_vsync_notification vsync_client;
 
 	pr_debug("mdp3_ctrl_reset_cmd\n");
 	mdp3_session = (struct mdp3_session_data *)mfd->mdp.private1;
@@ -754,7 +714,10 @@ static int mdp3_ctrl_reset_cmd(struct msm_fb_data_type *mfd)
 	if (vsync_client.handler)
 		mdp3_dma->vsync_enable(mdp3_dma, &vsync_client);
 
-	mdp3_session->first_commit = true;
+	if (mfd->fbi->screen_base)
+		rc = mdp3_dma->start(mdp3_dma, mdp3_session->intf);
+	else
+		mdp3_session->first_commit = true;
 
 reset_error:
 	mutex_unlock(&mdp3_session->lock);
@@ -767,7 +730,7 @@ static int mdp3_ctrl_reset(struct msm_fb_data_type *mfd)
 	struct mdp3_session_data *mdp3_session;
 	struct mdp3_dma *mdp3_dma;
 	struct mdss_panel_data *panel;
-	struct mdp3_notification vsync_client;
+	struct mdp3_vsync_notification vsync_client;
 
 	pr_debug("mdp3_ctrl_reset\n");
 	mdp3_session = (struct mdp3_session_data *)mfd->mdp.private1;
@@ -842,7 +805,10 @@ static int mdp3_ctrl_reset(struct msm_fb_data_type *mfd)
 	if (vsync_client.handler)
 		mdp3_dma->vsync_enable(mdp3_dma, &vsync_client);
 
-	mdp3_session->first_commit = true;
+	if (mfd->fbi->screen_base)
+		rc = mdp3_dma->start(mdp3_dma, mdp3_session->intf);
+	else
+		mdp3_session->first_commit = true;
 
 reset_error:
 	mutex_unlock(&mdp3_session->lock);
@@ -872,15 +838,6 @@ static int mdp3_overlay_set(struct msm_fb_data_type *mfd,
 {
 	int rc = 0;
 	struct mdp3_session_data *mdp3_session = mfd->mdp.private1;
-	struct mdp3_dma *dma = mdp3_session->dma;
-	struct fb_fix_screeninfo *fix;
-	struct fb_info *fbi = mfd->fbi;
-	int stride;
-	int format;
-
-	fix = &fbi->fix;
-	stride = req->src.width * ppp_bpp(req->src.format);
-	format = mdp3_ctrl_get_source_format(req->src.format);
 
 	mutex_lock(&mdp3_session->lock);
 
@@ -889,16 +846,6 @@ static int mdp3_overlay_set(struct msm_fb_data_type *mfd,
 
 	mdp3_session->overlay = *req;
 	if (req->id == MSMFB_NEW_REQUEST) {
-		if (dma->source_config.stride != stride ||
-				dma->source_config.format != format) {
-			dma->source_config.format = format;
-			dma->source_config.stride = stride;
-			dma->output_config.pack_pattern =
-				mdp3_ctrl_get_pack_pattern(req->src.format);
-			mdp3_clk_enable(1, 0);
-			mdp3_session->dma->dma_config_source(dma);
-			mdp3_clk_enable(0, 0);
-		}
 		mdp3_session->overlay.id = 1;
 		req->id = 1;
 	}
@@ -912,23 +859,10 @@ static int mdp3_overlay_unset(struct msm_fb_data_type *mfd, int ndx)
 {
 	int rc = 0;
 	struct mdp3_session_data *mdp3_session = mfd->mdp.private1;
-	struct fb_info *fbi = mfd->fbi;
-	struct fb_fix_screeninfo *fix;
-	int format;
 
-	fix = &fbi->fix;
-	format = mdp3_ctrl_get_source_format(mfd->fb_imgType);
 	mutex_lock(&mdp3_session->lock);
 
 	if (mdp3_session->overlay.id == ndx && ndx == 1) {
-		struct mdp3_dma *dma = mdp3_session->dma;
-		dma->source_config.format = format;
-		dma->source_config.stride = fix->line_length;
-		dma->output_config.pack_pattern =
-			mdp3_ctrl_get_pack_pattern(mfd->fb_imgType);
-		mdp3_clk_enable(1, 0);
-		mdp3_session->dma->dma_config_source(dma);
-		mdp3_clk_enable(0, 0);
 		mdp3_session->overlay.id = MSMFB_NEW_REQUEST;
 		mdp3_bufq_deinit(&mdp3_session->bufq_in);
 	} else {
@@ -1012,6 +946,7 @@ static int mdp3_ctrl_display_commit_kickoff(struct msm_fb_data_type *mfd,
 		mdp3_ctrl_reset(mfd);
 		reset_done = true;
 	}
+	mdp3_release_splash_memory();
 
 	mutex_lock(&mdp3_session->lock);
 
@@ -1021,33 +956,17 @@ static int mdp3_ctrl_display_commit_kickoff(struct msm_fb_data_type *mfd,
 		return -EPERM;
 	}
 
-	mdp3_ctrl_notify(mdp3_session, MDP_NOTIFY_FRAME_BEGIN);
 	data = mdp3_bufq_pop(&mdp3_session->bufq_in);
 	if (data) {
 		mdp3_ctrl_reset_countdown(mdp3_session, mfd);
 		mdp3_ctrl_clk_enable(mfd, 1);
-		rc = mdp3_session->dma->update(mdp3_session->dma,
+		mdp3_session->dma->update(mdp3_session->dma,
 			(void *)data->addr,
 			mdp3_session->intf);
-		/* This is for the previous frame */
-		if (rc < 0) {
-			mdp3_ctrl_notify(mdp3_session,
-				MDP_NOTIFY_FRAME_TIMEOUT);
-		} else {
-			if (mdp3_ctrl_get_intf_type(mfd) ==
-						MDP3_DMA_OUTPUT_SEL_DSI_VIDEO) {
-				mdp3_ctrl_notify(mdp3_session,
-					MDP_NOTIFY_FRAME_DONE);
-			}
-		}
-		mdp3_session->dma_active = 1;
-		init_completion(&mdp3_session->dma_completion);
-		mdp3_ctrl_notify(mdp3_session, MDP_NOTIFY_FRAME_FLUSHED);
 		mdp3_bufq_push(&mdp3_session->bufq_out, data);
 	}
 
-	if (mdp3_bufq_count(&mdp3_session->bufq_out) > 1) {
-		mdp3_release_splash_memory(mfd);
+	if (mdp3_bufq_count(&mdp3_session->bufq_out) > 2) {
 		data = mdp3_bufq_pop(&mdp3_session->bufq_out);
 		mdp3_put_img(data, MDP3_CLIENT_DMA_P);
 	}
@@ -1066,7 +985,7 @@ static int mdp3_ctrl_display_commit_kickoff(struct msm_fb_data_type *mfd,
 
 	mdss_fb_update_notify_update(mfd);
 
-	return 0;
+	return rc;
 }
 
 static void mdp3_ctrl_pan_display(struct msm_fb_data_type *mfd)
@@ -1076,7 +995,6 @@ static void mdp3_ctrl_pan_display(struct msm_fb_data_type *mfd)
 	u32 offset;
 	int bpp;
 	struct mdss_panel_info *panel_info = mfd->panel_info;
-	int rc;
 
 	pr_debug("mdp3_ctrl_pan_display\n");
 	if (!mfd || !mfd->mdp.private1)
@@ -1090,6 +1008,7 @@ static void mdp3_ctrl_pan_display(struct msm_fb_data_type *mfd)
 		pr_debug("continuous splash screen, IOMMU not attached\n");
 		mdp3_ctrl_reset(mfd);
 	}
+	mdp3_release_splash_memory();
 
 	mutex_lock(&mdp3_session->lock);
 
@@ -1112,25 +1031,10 @@ static void mdp3_ctrl_pan_display(struct msm_fb_data_type *mfd)
 
 	if (mfd->fbi->screen_base) {
 		mdp3_ctrl_reset_countdown(mdp3_session, mfd);
-		mdp3_ctrl_notify(mdp3_session, MDP_NOTIFY_FRAME_BEGIN);
 		mdp3_ctrl_clk_enable(mfd, 1);
-		rc = mdp3_session->dma->update(mdp3_session->dma,
-				(void *)(mfd->iova + offset),
+		mdp3_session->dma->update(mdp3_session->dma,
+				(void *)mfd->iova + offset,
 				mdp3_session->intf);
-		/* This is for the previous frame */
-		if (rc < 0) {
-			mdp3_ctrl_notify(mdp3_session,
-				MDP_NOTIFY_FRAME_TIMEOUT);
-		} else {
-			if (mdp3_ctrl_get_intf_type(mfd) ==
-						MDP3_DMA_OUTPUT_SEL_DSI_VIDEO) {
-				mdp3_ctrl_notify(mdp3_session,
-					MDP_NOTIFY_FRAME_DONE);
-			}
-		}
-		mdp3_session->dma_active = 1;
-		init_completion(&mdp3_session->dma_completion);
-		mdp3_ctrl_notify(mdp3_session, MDP_NOTIFY_FRAME_FLUSHED);
 	} else {
 		pr_debug("mdp3_ctrl_pan_display no memory, stop interface");
 		mdp3_clk_enable(1, 0);
@@ -1606,47 +1510,6 @@ static int mdp3_ctrl_lut_update(struct msm_fb_data_type *mfd,
 	return rc;
 }
 
-static int mdp3_overlay_prepare(struct msm_fb_data_type *mfd,
-		struct mdp_overlay_list __user *user_ovlist)
-{
-	struct mdp_overlay_list ovlist;
-	struct mdp3_session_data *mdp3_session = mfd->mdp.private1;
-	struct mdp_overlay *req_list;
-	struct mdp_overlay *req;
-	int rc;
-
-	if (!mdp3_session)
-		return -ENODEV;
-
-	req = &mdp3_session->req_overlay;
-
-	if (copy_from_user(&ovlist, user_ovlist, sizeof(ovlist)))
-		return -EFAULT;
-
-	if (ovlist.num_overlays != 1) {
-		pr_err("OV_PREPARE failed: only 1 overlay allowed\n");
-		return -EINVAL;
-	}
-
-	if (copy_from_user(&req_list, ovlist.overlay_list, sizeof(struct mdp_overlay*)))
-		return -EFAULT;
-
-	if (copy_from_user(req, req_list, sizeof(*req)))
-		return -EFAULT;
-
-	rc = mdp3_overlay_set(mfd, req);
-	if (!IS_ERR_VALUE(rc)) {
-		if (copy_to_user(req_list, req, sizeof(*req)))
-			return -EFAULT;
-	}
-
-	if (put_user(IS_ERR_VALUE(rc) ? 0 : 1,
-			&user_ovlist->processed_overlays))
-		return -EFAULT;
-
-	return rc;
-}
-
 static int mdp3_ctrl_ioctl_handler(struct msm_fb_data_type *mfd,
 					u32 cmd, void __user *argp)
 {
@@ -1663,8 +1526,7 @@ static int mdp3_ctrl_ioctl_handler(struct msm_fb_data_type *mfd,
 
 	req = &mdp3_session->req_overlay;
 
-	if (!mdp3_session->status && cmd != MSMFB_METADATA_GET &&
-		cmd != MSMFB_HISTOGRAM_STOP) {
+	if (!mdp3_session->status && cmd != MSMFB_METADATA_GET) {
 		pr_err("mdp3_ctrl_ioctl_handler, display off!\n");
 		return -EPERM;
 	}
@@ -1752,23 +1614,6 @@ static int mdp3_ctrl_ioctl_handler(struct msm_fb_data_type *mfd,
 	return rc;
 }
 
-int mdp3_wait_for_dma_done(struct mdp3_session_data *session)
-{
-	int rc = 0;
-
-	if (session->dma_active) {
-		rc = wait_for_completion_timeout(&session->dma_completion,
-			KOFF_TIMEOUT);
-		if (rc > 0) {
-			session->dma_active = 0;
-			rc = 0;
-		} else if (rc == 0) {
-			rc = -ETIME;
-		}
-	}
-	return rc;
-}
-
 int mdp3_ctrl_init(struct msm_fb_data_type *mfd)
 {
 	struct device *dev = mfd->fbi->dev;
@@ -1800,7 +1645,6 @@ int mdp3_ctrl_init(struct msm_fb_data_type *mfd)
 	memset(mdp3_session, 0, sizeof(struct mdp3_session_data));
 	mutex_init(&mdp3_session->lock);
 	INIT_WORK(&mdp3_session->clk_off_work, mdp3_dispatch_clk_off);
-	INIT_WORK(&mdp3_session->dma_done_work, mdp3_dispatch_dma_done);
 	atomic_set(&mdp3_session->vsync_countdown, 0);
 	mutex_init(&mdp3_session->histo_lock);
 	mdp3_session->dma = mdp3_get_dma_pipe(MDP3_DMA_CAP_ALL);
@@ -1836,16 +1680,12 @@ int mdp3_ctrl_init(struct msm_fb_data_type *mfd)
 	mdp3_bufq_init(&mdp3_session->bufq_out);
 	mdp3_session->histo_status = 0;
 	mdp3_session->lut_sel = 0;
-	BLOCKING_INIT_NOTIFIER_HEAD(&mdp3_session->notifier_head);
 
 	init_timer(&mdp3_session->vsync_timer);
 	mdp3_session->vsync_timer.function = mdp3_vsync_timer_func;
 	mdp3_session->vsync_timer.data = (u32)mdp3_session;
 	mdp3_session->vsync_period = 1000 / mfd->panel_info->mipi.frame_rate;
 	mfd->mdp.private1 = mdp3_session;
-	init_completion(&mdp3_session->dma_completion);
-	if (intf_type != MDP3_DMA_OUTPUT_SEL_DSI_VIDEO)
-		mdp3_session->wait_for_dma_done = mdp3_wait_for_dma_done;
 
 	rc = sysfs_create_group(&dev->kobj, &vsync_fs_attr_group);
 	if (rc) {
@@ -1868,16 +1708,13 @@ int mdp3_ctrl_init(struct msm_fb_data_type *mfd)
 	kobject_uevent(&dev->kobj, KOBJ_ADD);
 	pr_debug("vsync kobject_uevent(KOBJ_ADD)\n");
 
-	if (mdp3_get_cont_spash_en()) {
-		mdp3_session->clk_on = 1;
-		mdp3_ctrl_notifier_register(mdp3_session,
-			&mdp3_session->mfd->mdp_sync_pt_data.notifier);
-	}
-
 	if (splash_mismatch) {
 		pr_err("splash memory mismatch, stop splash\n");
 		mdp3_ctrl_off(mfd);
 	}
+
+	if (mdp3_get_cont_spash_en())
+		mdp3_session->clk_on = 1;
 
 	mdp3_session->vsync_before_commit = true;
 init_done:

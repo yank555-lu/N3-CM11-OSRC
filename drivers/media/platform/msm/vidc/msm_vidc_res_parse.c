@@ -289,7 +289,7 @@ static int msm_vidc_load_bus_vector(struct platform_device *pdev,
 		bus_pdata->usecase[i].vectors = kzalloc(
 			sizeof(*bus_pdata->usecase[i].vectors) * num_ports,
 			GFP_KERNEL);
-		if (!bus_pdata->usecase[i].vectors) {
+		if (!bus_pdata->usecase) {
 			dprintk(VIDC_ERR,
 				"%s Failed to alloc bus_pdata usecase\n",
 				__func__);
@@ -567,8 +567,8 @@ int read_platform_resources_from_dt(
 	kres = platform_get_resource(pdev, IORESOURCE_IRQ, 0);
 	res->irq = kres ? kres->start : -1;
 
-	of_property_read_u32(pdev->dev.of_node,
-			"qcom,ocmem-size", &res->has_ocmem);
+	res->has_ocmem = of_property_read_bool(pdev->dev.of_node,
+						"qcom,has-ocmem");
 
 	rc = msm_vidc_load_freq_table(res);
 	if (rc) {
