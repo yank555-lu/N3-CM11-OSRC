@@ -291,6 +291,7 @@ struct mdss_mdp_ad {
 struct mdss_ad_info {
 	u8 num;
 	u8 calc_hw_num;
+	u32 ops;
 	u32 sts;
 	u32 reg_sts;
 	u32 state;
@@ -311,6 +312,7 @@ struct mdss_ad_info {
 	uint32_t bl_bright_shift;
 	uint32_t bl_lin[AD_BL_LIN_LEN];
 	uint32_t bl_lin_inv[AD_BL_LIN_LEN];
+	uint32_t bl_att_lut[AD_BL_ATT_LUT_LEN];
 };
 
 struct pp_sts_type {
@@ -373,7 +375,6 @@ struct mdss_mdp_pipe {
 	u8 overfetch_disable;
 	u32 transp;
 	u32 bg_color;
-	u8 has_buf;
 
 	struct msm_fb_data_type *mfd;
 	struct mdss_mdp_mixer *mixer;

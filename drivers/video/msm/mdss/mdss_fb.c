@@ -110,6 +110,31 @@ void mdss_fb_no_update_notify_timer_cb(unsigned long data)
 	complete(&mfd->no_update.comp);
 }
 
+void mdss_fb_bl_update_notify(struct msm_fb_data_type *mfd)
+{
+	if (!mfd) {
+		pr_err("%s mfd NULL\n", __func__);
+		return;
+	}
+	mutex_lock(&mfd->update.lock);
+	if (mfd->update.ref_count > 0) {
+		mutex_unlock(&mfd->update.lock);
+		mfd->update.value = NOTIFY_TYPE_BL_UPDATE;
+		complete(&mfd->update.comp);
+		mutex_lock(&mfd->update.lock);
+	}
+	mutex_unlock(&mfd->update.lock);
+
+	mutex_lock(&mfd->no_update.lock);
+	if (mfd->no_update.ref_count > 0) {
+		mutex_unlock(&mfd->no_update.lock);
+		mfd->no_update.value = NOTIFY_TYPE_BL_UPDATE;
+		complete(&mfd->no_update.comp);
+		mutex_lock(&mfd->no_update.lock);
+	}
+	mutex_unlock(&mfd->no_update.lock);
+}
+
 static int mdss_fb_notify_update(struct msm_fb_data_type *mfd,
 							unsigned long *argp)
 {
@@ -127,13 +152,25 @@ static int mdss_fb_notify_update(struct msm_fb_data_type *mfd,
 
 	if (notify == NOTIFY_UPDATE_START) {
 		INIT_COMPLETION(mfd->update.comp);
+		mutex_lock(&mfd->update.lock);
+		mfd->update.ref_count++;
+		mutex_unlock(&mfd->update.lock);
 		ret = wait_for_completion_interruptible_timeout(
 						&mfd->update.comp, 4 * HZ);
+		mutex_lock(&mfd->update.lock);
+		mfd->update.ref_count--;
+		mutex_unlock(&mfd->update.lock);
 		to_user = (unsigned int)mfd->update.value;
 	} else if (notify == NOTIFY_UPDATE_STOP) {
 		INIT_COMPLETION(mfd->no_update.comp);
+		mutex_lock(&mfd->no_update.lock);
+		mfd->no_update.ref_count++;
+		mutex_unlock(&mfd->no_update.lock);
 		ret = wait_for_completion_interruptible_timeout(
 						&mfd->no_update.comp, 4 * HZ);
+		mutex_lock(&mfd->no_update.lock);
+		mfd->no_update.ref_count--;
+		mutex_unlock(&mfd->no_update.lock);
 		to_user = (unsigned int)mfd->no_update.value;
 	} else {
 		if (mfd->panel_power_on) {
@@ -832,6 +869,7 @@ void mdss_fb_set_backlight(struct msm_fb_data_type *mfd, u32 bkl_lvl)
 			mutex_unlock(&mfd->bl_lock);
 			/* Will trigger ad_setup which will grab bl_lock */
 			update_ad_input(mfd);
+			mdss_fb_bl_update_notify(mfd);
 			mutex_lock(&mfd->bl_lock);
 		}
 	}
@@ -1294,6 +1332,8 @@ static int mdss_fb_register(struct msm_fb_data_type *mfd)
 	init_timer(&mfd->no_update.timer);
 	mfd->no_update.timer.function = mdss_fb_no_update_notify_timer_cb;
 	mfd->no_update.timer.data = (unsigned long)mfd;
+	mfd->update.ref_count = 0;
+	mfd->no_update.ref_count = 0;
 	init_completion(&mfd->update.comp);
 	init_completion(&mfd->no_update.comp);
 	init_completion(&mfd->power_off_comp);
@@ -2033,11 +2073,11 @@ static int mdss_fb_set_par(struct fb_info *info)
 
 int mdss_fb_dcm(struct msm_fb_data_type *mfd, int req_state)
 {
-	int ret = -EINVAL;
+	int ret = 0;
 
 	if (req_state == mfd->dcm_state) {
-		pr_warn("Already in correct DCM state");
-		ret = 0;
+		pr_warn("Already in correct DCM/DTM state");
+		return ret;
 	}
 
 	switch (req_state) {
@@ -2053,11 +2093,12 @@ int mdss_fb_dcm(struct msm_fb_data_type *mfd, int req_state)
 		break;
 	case DCM_ENTER:
 		if (mfd->dcm_state == DCM_UNBLANK) {
-			/* Keep unblank path available for only
-			DCM operation */
+			/*
+			 * Keep unblank path available for only
+			 * DCM operation
+			 */
 			mfd->panel_power_on = false;
 			mfd->dcm_state = DCM_ENTER;
-			ret = 0;
 		}
 		break;
 	case DCM_EXIT:
@@ -2065,7 +2106,6 @@ int mdss_fb_dcm(struct msm_fb_data_type *mfd, int req_state)
 			/* Release the unblank path for exit */
 			mfd->panel_power_on = true;
 			mfd->dcm_state = DCM_EXIT;
-			ret = 0;
 		}
 		break;
 	case DCM_BLANK:
@@ -2079,7 +2119,16 @@ int mdss_fb_dcm(struct msm_fb_data_type *mfd, int req_state)
 			}
 		}
 		break;
+	case DTM_ENTER:
+		if (mfd->dcm_state == DCM_UNINIT)
+			mfd->dcm_state = DTM_ENTER;
+		break;
+	case DTM_EXIT:
+		if (mfd->dcm_state == DTM_ENTER)
+			mfd->dcm_state = DCM_UNINIT;
+		break;
 	}
+
 	return ret;
 }
 
